@@ -1,2 +1,7 @@
 # raw debug captures — keep out of the published repo
 *.btsnoop
+
+# cached firmware binaries — large, and redistribution of Intel-licensed
+# blobs isn't something to publish; keep the sha256/provenance in the .md
+# instead and re-fetch from the Arch Linux Archive if this cache is lost
+firmware-cache/

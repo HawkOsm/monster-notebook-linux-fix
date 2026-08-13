@@ -28,6 +28,66 @@ not Linux. Fix is in the Soundcore app, not Linux. See "Audio glitches" section 
 
 ---
 
+## Arch Linux port (2026-08-13)
+
+System moved from Ubuntu 24.04/26.04 to **Arch Linux** (kernel `7.1.8-arch1-3`),
+desktop is now Hyprland (Caelestia shell) instead of GNOME. Confirmed **same
+physical hardware**: `iwlwifi` identifies it as `Intel(R) Wi-Fi 6E AX211`, and
+the Bluetooth half enumerates at `usb 3-10` on `pci0000:00/0000:00:14.0/usb3`
+— matching this doc's topology notes exactly.
+
+**Fresh install shipped the known-bad build.** `pacman`'s `linux-firmware-intel`
+(`20260622-1`) puts down `Firmware timestamp 2025.20 buildtype 1 build 3882`,
+SHA1 `0x937bca4a` — the same crashy build documented above, confirmed via
+`journalctl -k -b`. No `Hardware error 0x0c` yet in the first boot (bluetooth
+was only just enabled), but expected given the documented pattern — and this
+kernel (7.1) is in the "worse" bracket the original notes warned about
+(6.17/7.0 crash every 1–3 min vs. 6.8's ~13 min).
+
+**No apt-mark-hold equivalent needed.** Arch ships the firmware *compressed*
+(`/usr/lib/firmware/intel/ibt-0180-0041.sfi.zst`, owned by `linux-firmware-intel`),
+and the kernel firmware loader prefers an uncompressed `.sfi` with the same
+base name if one exists alongside it. So the fix is just to drop the known-good
+uncompressed blob in next to it — pacman doesn't own that filename, so
+`pacman -Syu` can never overwrite it. No hold, no pacman hook needed.
+
+**Recovered build 3243** from the Arch Linux Archive (checked package-by-package
+against the sha256 table above): it first appears in
+`linux-firmware-20240703.e94a2a3b-1` (verified sha256 `fceb7e375d0203...`,
+exact match). Cached locally at `firmware-cache/ibt-0180-0041.sfi.stable-3243`
+(gitignored — binary blob, not published to the repo). If that cache is ever
+lost, re-derive it:
+```bash
+curl -O https://archive.archlinux.org/packages/l/linux-firmware/linux-firmware-20240703.e94a2a3b-1-any.pkg.tar.zst
+tar --zstd -xf linux-firmware-20240703.e94a2a3b-1-any.pkg.tar.zst \
+    usr/lib/firmware/intel/ibt-0180-0041.sfi.zst -O | zstd -d -o ibt-0180-0041.sfi.stable-3243
+sha256sum ibt-0180-0041.sfi.stable-3243   # expect fceb7e375d020357b3ca10dbad2fb5be6ec8a4d6bbb07feb35dc3869dfa440e9
+```
+
+**Apply on this machine:**
+```bash
+sudo cp /home/osm/Documents/GitHub/monster-notebook-linux/firmware-cache/ibt-0180-0041.sfi.stable-3243 \
+        /usr/lib/firmware/intel/ibt-0180-0041.sfi
+sudo systemctl stop bluetooth
+sudo modprobe -r btusb btintel
+sudo modprobe btusb
+sudo systemctl start bluetooth
+journalctl -k -b | grep -E "Firmware (timestamp|SHA1)" | tail -2
+# expect: Firmware timestamp 2024.18 buildtype 1 build 3243 / SHA1: 0xa8bb3f39
+```
+
+**bluez tuning not yet ported.** `/etc/bluetooth/main.conf` and `input.conf`
+are stock Arch defaults (everything commented out) — the Ubuntu-era
+`ReconnectUUIDs` (HID profile), `ReconnectAttempts`/`Intervals`, `IdleTimeout`,
+and SAP-plugin-disable drop-in from the "Configuration Currently Applied"
+section below have **not** been re-applied here yet. Worth porting if a BT
+keyboard/mouse shows the same reconnect flakiness; the USB-autosuspend rule
+too, once the affected USB bus ID is confirmed on this box (still `3-10` per
+above, so likely reusable as-is). The `logind` suspend-storm drop-in is
+**not** ported — that was a fix for a different symptom (`tracker-miner-fs-3`
+D-state hangs blocking suspend) that hasn't been observed on this install;
+apply only if the same crash-storm-on-suspend pattern actually shows up here.
+
 ## Symptom
 
 ```

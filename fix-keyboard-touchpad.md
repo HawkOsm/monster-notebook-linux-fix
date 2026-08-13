@@ -20,6 +20,54 @@ The Embedded Controller (EC) on Clevo boards has a hardware-level touchpad enabl
 
 ---
 
+## Arch Linux port (2026-08-13)
+
+Same laptop (`TULPAR T6 V2.1` per `/sys/class/dmi/id/product_name`), moved to
+**Arch Linux** (kernel `7.1.8-arch1-3`), desktop is Hyprland (Caelestia shell)
+instead of GNOME. The DMI-gate bug and the fix are identical — Arch just uses
+different packaging.
+
+**No Tuxedo apt repo needed.** Skip Step 1 entirely; install from the AUR
+instead (`yay` already on this system):
+
+```bash
+yay -S --needed tuxedo-drivers-dkms tuxedo-control-center-bin
+```
+
+At the time of writing this pulled `tuxedo-drivers-dkms 4.22.2-2` —
+**the exact same version** (`4.22.2`) this doc's Step 3 patch was written
+against, so the DMI patch (Python script or manual edit) applies verbatim,
+same file path:
+
+```
+/usr/src/tuxedo-drivers-4.22.2/tuxedo_compatibility_check/tuxedo_compatibility_check.c
+```
+
+Confirmed on this install: `modprobe tuxedo_keyboard` failed with the exact
+`No such device` from "Why This Happens" before patching, and loaded clean
+after. `tuxedo-control-center-bin` (not the source-build `tuxedo-control-center`)
+was used to skip compiling Electron — installs `tccd.service`
+pre-enabled, no separate systemd setup needed.
+
+Steps 4–7 (rebuild DKMS, `/etc/modules-load.d/tuxedo.conf`, load modules now,
+set backlight brightness) are unchanged and apply as-is — just use the
+corrected Step 6 loop below, not the original one-liner.
+
+**Touchpad was never stuck here** — unlike the scenario this doc was
+originally written for, `/dev/tuxedo_io`'s EC touchpad-enabled flag read `0`
+(disabled) on first check, but the touchpad (`FTCS1000:01 2808:0222`, a
+generic `i2c_hid` device, not gated through `tuxedo_io` on this board) worked
+throughout regardless. So Steps 8–9 (EC unlock script, persistent boot
+service) were **not applied** — nothing was stuck to unstick. If the
+touchpad ever does go dead on this install, they're the fallback; see also
+the live Fn-key toggle in "Hyprland: Wiring the Fn Hotkeys" below, which is a
+different mechanism (toggles the same EC flag on demand from a keypress,
+rather than force-enabling it once at boot).
+
+Step 10 (initramfs + reboot) wasn't needed — `yay`'s pacman hook already
+rebuilds the initcpio automatically on DKMS install, and all modules were
+loaded live via `modprobe` in the same session.
+
 ## Step 1 — Add the Tuxedo Repository
 
 Skip this step if you already have the Tuxedo repo configured.
@@ -129,8 +177,19 @@ EOF
 ```bash
 sudo modprobe -r tuxedo_keyboard tuxedo_compatibility_check 2>/dev/null || true
 sudo modprobe tuxedo_keyboard
-sudo modprobe clevo_acpi clevo_wmi tuxedo_io ite_829x 2>/dev/null || true
+for m in clevo_acpi clevo_wmi tuxedo_io ite_829x; do
+  sudo modprobe "$m" 2>/dev/null || true
+done
 ```
+
+> **Correction (2026-08-13):** the original one-liner here —
+> `sudo modprobe clevo_acpi clevo_wmi tuxedo_io ite_829x` — silently only loads
+> `clevo_acpi`. Unlike `modprobe -r`, plain `modprobe` only accepts **one**
+> module name; anything after it is parsed as module *parameters*, not
+> additional modules to load. It fails quietly here because of the trailing
+> `2>/dev/null || true`. Confirmed via `lsmod` on the Arch install below —
+> `clevo_wmi`, `tuxedo_io`, and `ite_829x` never actually loaded until each
+> was `modprobe`d individually.
 
 ## Step 7 — Set Keyboard Backlight to Full Brightness
 
@@ -307,6 +366,107 @@ Keyboard shortcuts (hold `Fn`):
 | `Fn` + `*` | Cycle colors |
 | `Fn` + `+` | Brightness up |
 | `Fn` + `-` | Brightness down |
+
+---
+
+## Hyprland: Wiring the Fn Hotkeys (2026-08-13)
+
+The "Manual Keyboard Backlight Controls" table above (`Fn`+`/`, `Fn`+`*`, etc.)
+describes GNOME's behavior, where these keys just work once the driver loads
+— GNOME's own settings daemon listens for the standard hotkey input events
+and acts on them. **Hyprland does none of that automatically.** The driver
+still emits correct, standard Linux input events — confirmed by decoding
+`/proc/bus/input/devices`' `KEY=` bitmap for the `TUXEDO Keyboard` device
+against `/usr/include/linux/input-event-codes.h` — but with zero compositor
+config, they're delivered and then go nowhere.
+
+On this board (Tulpar T6 V2.1), the driver source
+(`clevo_keyboard.h`) maps them to:
+
+| Physical key | Emitted event | Note |
+|---|---|---|
+| Touchpad toggle | `KEY_F21` | Driver comment: *"the weirdly named touchpad toggle key that is implemented as KEY_F21 everywhere (instead of KEY_TOUCHPAD_TOGGLE or on/off)"* |
+| Kbd brightness up | `KEY_KBDILLUMUP` | |
+| Kbd brightness down | `KEY_KBDILLUMDOWN` | |
+| Kbd backlight toggle | `KEY_KBDILLUMTOGGLE` | |
+
+None of these change any hardware state by themselves — `sparse_keymap`
+drivers only report the event; something in userspace has to act on it.
+`tccd` does **not** listen to this device directly (checked: no open fd on
+its `event*` node), it only manages brightness via UPower D-Bus once told to.
+So the fix is compositor-level binds. Added to
+`~/.config/caelestia/hypr-user.lua` (the shell's designated user-override
+file, loaded last by `hyprland.lua`):
+
+```lua
+local KBD_LED = "/sys/class/leds/rgb:kbd_backlight/brightness"
+local KBD_LED_MAX = 255
+local KBD_LED_STEP = 32
+
+-- touchpad toggle: flips the same /dev/tuxedo_io EC flag Step 8 reads,
+-- but live, on every keypress, instead of once at boot
+hl.bind("F21", hl.dsp.exec_cmd(
+    "bash -c 'S=$(sudo python3 /usr/local/bin/tuxedo-touchpad-toggle.py); " ..
+    "notify-send -u low -i input-touchpad \"Touchpad\" \"$([ \"$S\" = 1 ] && echo Enabled || echo Disabled)\"'"
+))
+
+hl.bind("XF86KbdBrightnessUp", hl.dsp.exec_cmd(
+    "bash -c 'v=$(cat " .. KBD_LED .. "); n=$((v+" .. KBD_LED_STEP .. ")); " ..
+    "[ $n -gt " .. KBD_LED_MAX .. " ] && n=" .. KBD_LED_MAX .. "; " ..
+    "echo $n | sudo tee " .. KBD_LED .. " >/dev/null'"
+))
+
+hl.bind("XF86KbdBrightnessDown", hl.dsp.exec_cmd(
+    "bash -c 'v=$(cat " .. KBD_LED .. "); n=$((v-" .. KBD_LED_STEP .. ")); " ..
+    "[ $n -lt 0 ] && n=0; echo $n | sudo tee " .. KBD_LED .. " >/dev/null'"
+))
+
+hl.bind("XF86KbdLightOnOff", hl.dsp.exec_cmd(
+    "bash -c 'v=$(cat " .. KBD_LED .. "); " ..
+    "if [ \"$v\" -gt 0 ]; then echo 0 | sudo tee " .. KBD_LED .. " >/dev/null; " ..
+    "else echo " .. KBD_LED_MAX .. " | sudo tee " .. KBD_LED .. " >/dev/null; fi'"
+))
+```
+
+`F21` and the `XF86Kbd*` names are Hyprland's standard XKB-derived keysym
+names for those exact evdev codes — no modifier prefix, since `Fn` is
+consumed by the keyboard's own firmware and never reaches the OS as a
+separate modifiable event; the keyboard just sends the remapped key directly.
+
+The touchpad toggle calls a small helper (needs root for the `/dev/tuxedo_io`
+ioctl, hence `sudo` — passwordless sudo is configured on this machine):
+
+```python
+#!/usr/bin/env python3
+# /usr/local/bin/tuxedo-touchpad-toggle.py
+import fcntl, ctypes, struct, sys
+
+def _IOC(d, t, n, s): return (d << 30) | (s << 16) | (t << 8) | n
+ptr = ctypes.sizeof(ctypes.c_void_p)
+R_TP = _IOC(2, 0xED, 0x15, ptr)
+W_TP = _IOC(1, 0xEE, 0x14, ptr)
+
+try:
+    fd = open("/dev/tuxedo_io", "rb+", buffering=0)
+    buf = ctypes.create_string_buffer(8)
+    fcntl.ioctl(fd, R_TP, buf)
+    state = struct.unpack("i", buf[:4])[0]
+    new_state = 0 if state else 1
+    wb = ctypes.create_string_buffer(struct.pack("i", new_state) + b'\x00' * 4)
+    fcntl.ioctl(fd, W_TP, wb)
+    fd.close()
+    print(new_state)
+except Exception as e:
+    print(f"touchpad toggle failed: {e}", file=sys.stderr)
+    sys.exit(1)
+```
+
+Install with `sudo install -m 0755 tuxedo-touchpad-toggle.py /usr/local/bin/`.
+
+After editing `hypr-user.lua`: `hyprctl reload`, then confirm with
+`hyprctl binds | grep -A6 "key: F21"` (or `XF86KbdBrightnessUp`, etc.) —
+should show a live `bind` entry with `modmask: 0`. Physical Fn-key presses
+aren't verifiable from a shell session; test by hand after reload.
 
 ---
 
